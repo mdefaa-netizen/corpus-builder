@@ -57,6 +57,8 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+* {color: #ffffff !important;}
+
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
 .stApp{background-color:#0d1117;color:#e6edf3;}
