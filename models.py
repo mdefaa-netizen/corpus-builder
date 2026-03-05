@@ -156,7 +156,7 @@ class Document:
     title:            str = ""
     text:             str = ""
     episode:          str = "Syrian_Transition"
-    research_theme:   str = "Syrian_Transition"
+    research_theme:   str = "Algorithmic_Diplomacy"
     region:           str = "Syria"
     period:           str = "2024"
     language:         str = "en"
