@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: marc03-corpus-builder
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+disks:
+  - name: corpus-data
+    mountPath: /data
+    sizeGB: 1
