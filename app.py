@@ -78,7 +78,10 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#58a6
 *{color:#ffffff!important;}
 [data-baseweb="select"]>div{background:#161b22!important;border-color:#30363d!important;}
 [data-baseweb="menu"]{background:#161b22!important;}
+[data-baseweb="menu"] ul{background:#161b22!important;}
+[data-baseweb="menu"] li{background:#161b22!important;color:#ffffff!important;}
 [data-baseweb="menu"] li:hover{background:#21262d!important;}
+[data-baseweb="option"]{background:#161b22!important;color:#ffffff!important;}
 input,textarea{color:#ffffff!important;}
 </style>
 """,
