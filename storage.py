@@ -41,7 +41,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             doc_id           TEXT PRIMARY KEY,
             title            TEXT DEFAULT '',
             text             TEXT DEFAULT '',
-            episode          TEXT DEFAULT 'EP-05_Unassigned',
+            episode          TEXT DEFAULT 'Syrian_Transition',
             research_theme   TEXT DEFAULT '',
             region           TEXT DEFAULT '',
             period           TEXT DEFAULT '',
@@ -83,7 +83,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for row in conn.execute("PRAGMA table_info(documents)").fetchall()
     }
     new_columns = {
-        "episode":        "TEXT DEFAULT 'EP-05_Unassigned'",
+        "episode":        "TEXT DEFAULT 'Syrian_Transition'",
         "research_theme": "TEXT DEFAULT ''",
         "quadrad_actor":  "TEXT DEFAULT 'Not_applicable'",
     }

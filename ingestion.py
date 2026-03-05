@@ -7,6 +7,7 @@ No local imports -- this module is a pure utility layer.
 
 import io
 import re
+import time
 from typing import Tuple
 
 import requests
@@ -58,9 +59,21 @@ def scrape_url(url: str) -> Tuple[str, str]:
     requests.Timeout
         If the request takes longer than 15 seconds.
     """
+    time.sleep(2)
     response = requests.get(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (MARC-03 Corpus Builder)"},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8,fr;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        },
         timeout=15,
     )
     response.raise_for_status()

@@ -73,6 +73,9 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#58a6
 .stTabs [aria-selected="true"]{color:#58a6ff!important;}
 .lbl{font-family:'IBM Plex Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:#8b949e;margin-bottom:.3rem;}
 .score-pill{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:.15rem .6rem;font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:#58a6ff;margin:.1rem;}
+label,div[data-testid="stWidgetLabel"] p,.stTextInput label,.stTextArea label,.stSelectbox label,.stRadio label,.stCheckbox label,.stSlider label,.stFileUploader label{color:#e6edf3!important;}
+.stRadio div[role="radiogroup"] label{color:#e6edf3!important;}
+div[data-testid="stForm"] label{color:#e6edf3!important;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -311,7 +314,7 @@ def _tab_add(episode: str, existing_ids: Set[str]) -> None:
     )
     st.divider()
 
-    default_episode = episode if episode != "All" else "EP-05_Unassigned"
+    default_episode = episode if episode != "All" else "Syrian_Transition"
     prefilled = Document(episode=default_episode)
 
     if method == "Scrape URL":

@@ -41,11 +41,9 @@ QUADRAD_ACTORS: List[str] = [
 ]
 
 EPISODES: List[str] = [
-    "EP-01_Syria_Ceasefire_2024",
-    "EP-02_Red_Sea_Houthi_2023-24",
-    "EP-03_Gulf_Normalization",
-    "EP-04_Digital_AI_Diplomacy",
-    "EP-05_Unassigned",
+    "Syrian_Transition",
+    "Normalization_Quadrad",
+    "Reconstruction",
 ]
 
 # ── FLATTENING AUDIT ─────────────────────────────────────────────────────────
@@ -157,7 +155,7 @@ class Document:
     doc_id:           str = ""
     title:            str = ""
     text:             str = ""
-    episode:          str = "EP-05_Unassigned"
+    episode:          str = "Syrian_Transition"
     research_theme:   str = "Syrian_Transition"
     region:           str = "Syria"
     period:           str = "2024"
