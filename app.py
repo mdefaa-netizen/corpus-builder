@@ -75,9 +75,11 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#58a6
 .stTabs [aria-selected="true"]{color:#58a6ff!important;}
 .lbl{font-family:'IBM Plex Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:#8b949e;margin-bottom:.3rem;}
 .score-pill{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:.15rem .6rem;font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:#58a6ff;margin:.1rem;}
-label,div[data-testid="stWidgetLabel"] p,.stTextInput label,.stTextArea label,.stSelectbox label,.stRadio label,.stCheckbox label,.stSlider label,.stFileUploader label{color:#e6edf3!important;}
-.stRadio div[role="radiogroup"] label{color:#e6edf3!important;}
-div[data-testid="stForm"] label{color:#e6edf3!important;}
+*{color:#ffffff!important;}
+[data-baseweb="select"]>div{background:#161b22!important;border-color:#30363d!important;}
+[data-baseweb="menu"]{background:#161b22!important;}
+[data-baseweb="menu"] li:hover{background:#21262d!important;}
+input,textarea{color:#ffffff!important;}
 </style>
 """,
     unsafe_allow_html=True,
