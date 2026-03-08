@@ -1,833 +1,970 @@
 """
-MARC-03 Corpus Builder -- Main Streamlit application.
-
-Entry point: ``streamlit run app.py``
-
-Tab layout:
-    Add Document | Library | Flattening Audit | Validate | Export
-
-The episode selector lives in the sidebar and propagates to every tab.
+CB-01 — Corpus Builder v2
+ALG-PIVOT · Mohamed Defaa · Capitol Technology University
+Trilingual corpus ingestion, annotation, and export for dissertation research.
 """
 
+import os
+import sqlite3
+import hashlib
+import hmac
+import re
+import io
+import csv
 import datetime
-from typing import List, Optional, Set
-
-import requests
+import time
 import streamlit as st
 
-from export import audit_to_csv, corpus_stats, to_context_block, to_csv
-from ingestion import extract_pdf, scrape_url, wc
-from models import (
-    AUDIT_DIMENSIONS,
-    AUDIT_RUBRIC,
-    EPISODES,
-    IDEOLOGY_TAGS,
-    INSTITUTION_AUTOFILL,
-    LANGUAGES,
-    PERIODS,
-    QUADRAD_ACTORS,
-    REGIONS,
-    RESEARCH_THEMES,
-    SOURCE_TYPES,
-    AuditEntry,
-    Document,
-)
-from storage import (
-    all_ids,
-    delete_audit,
-    delete_doc,
-    list_audits,
-    list_docs,
-    upsert_audit,
-    upsert_doc,
-)
-from validation import MIN_WORDS, suggest_id, validate
+# ── Optional heavy imports ────────────────────────────────────────────────────
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    SCRAPE_AVAILABLE = True
+except ImportError:
+    SCRAPE_AVAILABLE = False
 
-# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="Corpus Builder · MARC-03",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── THEME ─────────────────────────────────────────────────────────────────────
-
-st.markdown(
-    """
-<style>
-* {color: #ffffff !important;}
-
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
-.stApp{background-color:#0d1117;color:#e6edf3;}
-section[data-testid="stSidebar"]{background-color:#161b22;border-right:1px solid #30363d;}
-div[data-testid="metric-container"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.75rem 1rem;}
-div[data-testid="metric-container"] label{color:#8b949e!important;font-size:.72rem!important;}
-div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#58a6ff!important;font-family:'IBM Plex Mono',monospace;}
-.stTextInput input,.stTextArea textarea{background-color:#161b22!important;border:1px solid #30363d!important;color:#e6edf3!important;border-radius:6px!important;}
-.stSelectbox div[data-baseweb="select"]>div{background-color:#161b22!important;border-color:#30363d!important;color:#e6edf3!important;}
-.stButton>button{background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:6px;font-size:.82rem;}
-.stButton>button:hover{border-color:#58a6ff;color:#58a6ff;}
-.stButton>button[kind="primary"]{background:#1f6feb;border-color:#1f6feb;color:#fff;}
-.stTabs [data-baseweb="tab"]{font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#8b949e;}
-.stTabs [aria-selected="true"]{color:#58a6ff!important;}
-.lbl{font-family:'IBM Plex Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:#8b949e;margin-bottom:.3rem;}
-.score-pill{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:.15rem .6rem;font-family:'IBM Plex Mono',monospace;font-size:.75rem;color:#58a6ff;margin:.1rem;}
-*{color:#ffffff!important;}
-[data-baseweb="select"]>div{background:#161b22!important;border-color:#30363d!important;}
-[data-baseweb="menu"]{background:#161b22!important;}
-[data-baseweb="menu"] ul{background:#161b22!important;}
-[data-baseweb="menu"] li{background:#161b22!important;color:#ffffff!important;}
-[data-baseweb="menu"] li:hover{background:#21262d!important;}
-[data-baseweb="option"]{background:#161b22!important;color:#ffffff!important;}
-input,textarea{color:#ffffff!important;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-
-
-def _idx(lst: list, val: str) -> int:
-    """Return the index of val in lst, or 0 if not found."""
+try:
+    import pdfplumber
+    PDF_AVAILABLE = True
+except ImportError:
     try:
-        return lst.index(val)
-    except ValueError:
-        return 0
+        import PyPDF2
+        PDF_AVAILABLE = True
+        PDFPLUMBER = False
+    except ImportError:
+        PDF_AVAILABLE = False
 
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
+APP_PASSWORD = os.environ.get("CB01_PASSWORD", "algpivot2026")
 
-def _render_sidebar(all_docs: List[Document]) -> str:
-    """Render the sidebar and return the selected episode filter.
+DB_PATH = os.environ.get("CB01_DB_PATH",
+    "/data/corpus.db" if os.path.isdir("/data") else "corpus.db"
+)
 
-    The episode selectbox is the global filter that propagates to all tabs.
+INSTITUTIONS = {
+    "Brookings": {"code": "Brookings", "source_type": "think_tank", "ideology": "liberal_multilateral"},
+    "CAP":       {"code": "CAP",       "source_type": "think_tank", "ideology": "liberal_multilateral"},
+    "Carnegie":  {"code": "Carnegie",  "source_type": "think_tank", "ideology": "liberal_multilateral"},
+    "Heritage":  {"code": "Heritage",  "source_type": "think_tank", "ideology": "conservative_hawkish"},
+    "AEI":       {"code": "AEI",       "source_type": "think_tank", "ideology": "conservative_hawkish"},
+    "Hudson":    {"code": "Hudson",    "source_type": "think_tank", "ideology": "conservative_hawkish"},
+    "FDD":       {"code": "FDD",       "source_type": "think_tank", "ideology": "conservative_hawkish"},
+    "Quincy":    {"code": "Quincy",    "source_type": "think_tank", "ideology": "restraint"},
+    "AtlanticC": {"code": "AtlanticC", "source_type": "think_tank", "ideology": "liberal_multilateral"},
+    "Wilson":    {"code": "Wilson",    "source_type": "think_tank", "ideology": "liberal_multilateral"},
+    "Other":     {"code": "Other",     "source_type": "other",      "ideology": "NA"},
+}
 
-    Parameters
-    ----------
-    all_docs:
-        The unfiltered document list, used for sidebar metrics.
+EPISODES   = ["Syrian_Transition", "Normalization_Quadrad", "Reconstruction"]
+LANGUAGES  = {"English": "en", "Arabic": "ar", "French": "fr"}
+DOC_TYPES  = ["policy_brief", "research_report", "testimony", "working_paper", "government_document", "other"]
+IDEOLOGIES = ["liberal_multilateral", "conservative_hawkish", "restraint", "NA"]
+SOURCE_TYPES = ["think_tank", "government", "ngo", "academic", "media", "intl_org", "other"]
 
-    Returns
-    -------
-    str
-        Selected episode label ("All" or a specific episode key).
-    """
-    with st.sidebar:
-        st.markdown("### CORPUS BUILDER")
-        st.caption("MARC-03 · PhD Research Corpus")
-        st.divider()
+# ═══════════════════════════════════════════════════════════════════════════════
+# DESIGN SYSTEM  (ALG-PIVOT canonical palette + IBM Plex)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        episode: str = st.selectbox(
-            "Episode filter",
-            ["All"] + EPISODES,
-            key="global_episode",
-            help="Filters all tabs to show only documents from this episode.",
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+/* ── Root ── */
+:root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #30363d;
+    --accent:  #58a6ff;
+    --accent2: #3fb950;
+    --warn:    #d29922;
+    --danger:  #f85149;
+    --text:    #e6edf3;
+    --muted:   #8b949e;
+    --mono:    'IBM Plex Mono', monospace;
+    --sans:    'IBM Plex Sans', sans-serif;
+}
+
+/* ── Global ── */
+html, body, [class*="css"] {
+    font-family: var(--sans) !important;
+    color: var(--text) !important;
+    background-color: var(--bg) !important;
+}
+
+/* ── Hide default Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 1.5rem; padding-bottom: 4rem; }
+
+/* ── Headings ── */
+h1, h2, h3 { font-family: var(--mono) !important; letter-spacing: -0.02em; }
+h1 { color: var(--accent) !important; font-size: 1.4rem !important; }
+h2 { color: var(--text) !important;   font-size: 1.1rem !important; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; margin-top: 1.5rem; }
+h3 { color: var(--muted) !important;  font-size: 0.9rem !important; }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background-color: var(--surface) !important;
+    border-right: 1px solid var(--border) !important;
+}
+[data-testid="stSidebar"] * { color: var(--text) !important; }
+
+/* ── Inputs — the critical fix ── */
+input, textarea, select,
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stNumberInput"] input,
+.stTextInput input,
+.stTextArea textarea {
+    background-color: var(--surface) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 4px !important;
+    font-family: var(--sans) !important;
+}
+
+input:focus, textarea:focus {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 2px rgba(88,166,255,0.15) !important;
+    outline: none !important;
+}
+
+/* ── Selectbox / Dropdown — THE KEY FIX ── */
+[data-testid="stSelectbox"] > div > div,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+[data-testid="stSelectbox"] div[role="listbox"],
+[data-testid="stSelectbox"] div[role="option"],
+[data-testid="stMultiSelect"] > div > div,
+[data-testid="stMultiSelect"] div[data-baseweb="select"] > div,
+.stSelectbox div[data-baseweb="select"] div,
+div[data-baseweb="select"] {
+    background-color: var(--surface) !important;
+    color: var(--text) !important;
+    border-color: var(--border) !important;
+}
+
+/* Dropdown menu popup */
+div[data-baseweb="popover"],
+div[data-baseweb="popover"] *,
+ul[data-testid="stSelectboxVirtualDropdown"],
+ul[data-testid="stSelectboxVirtualDropdown"] li,
+div[role="listbox"],
+div[role="listbox"] div,
+div[role="option"],
+li[role="option"] {
+    background-color: var(--surface) !important;
+    color: var(--text) !important;
+}
+
+div[role="option"]:hover,
+li[role="option"]:hover {
+    background-color: var(--border) !important;
+    color: var(--accent) !important;
+}
+
+/* Selected value text inside selectbox */
+[data-testid="stSelectbox"] span,
+[data-testid="stSelectbox"] p,
+div[data-baseweb="select"] span {
+    color: var(--text) !important;
+}
+
+/* ── Buttons ── */
+.stButton > button {
+    background-color: var(--surface) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border) !important;
+    font-family: var(--mono) !important;
+    font-size: 0.8rem !important;
+    border-radius: 4px !important;
+    transition: border-color 0.15s, color 0.15s;
+}
+.stButton > button:hover {
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+}
+.stButton > button[kind="primary"] {
+    background-color: var(--accent) !important;
+    color: #0d1117 !important;
+    border-color: var(--accent) !important;
+    font-weight: 600 !important;
+}
+
+/* ── Download button ── */
+[data-testid="stDownloadButton"] button {
+    background-color: var(--accent2) !important;
+    color: #0d1117 !important;
+    border-color: var(--accent2) !important;
+    font-family: var(--mono) !important;
+    font-size: 0.8rem !important;
+    font-weight: 600 !important;
+}
+
+/* ── Metrics ── */
+[data-testid="metric-container"] {
+    background-color: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 6px !important;
+    padding: 0.8rem !important;
+}
+[data-testid="metric-container"] label { color: var(--muted) !important; font-family: var(--mono) !important; font-size: 0.75rem !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(--accent) !important; font-family: var(--mono) !important; }
+
+/* ── Dataframe ── */
+[data-testid="stDataFrame"] { border: 1px solid var(--border) !important; border-radius: 4px; }
+
+/* ── Alerts ── */
+.stAlert { border-radius: 4px !important; }
+
+/* ── Tabs ── */
+[data-testid="stTab"] { font-family: var(--mono) !important; font-size: 0.8rem !important; }
+button[data-baseweb="tab"] { color: var(--muted) !important; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--accent) !important; border-bottom-color: var(--accent) !important; }
+
+/* ── Expander ── */
+[data-testid="stExpander"] details {
+    background-color: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 4px !important;
+}
+[data-testid="stExpander"] summary { color: var(--muted) !important; font-family: var(--mono) !important; font-size: 0.8rem !important; }
+
+/* ── Code / mono spans ── */
+code { background-color: var(--border) !important; color: var(--accent) !important; padding: 0.1rem 0.3rem; border-radius: 3px; font-family: var(--mono) !important; }
+
+/* ── Divider ── */
+hr { border-color: var(--border) !important; margin: 1rem 0; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ── Doc card ── */
+.doc-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 0.6rem;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+}
+.doc-card .doc-id  { color: var(--accent); font-weight: 600; }
+.doc-card .doc-meta { color: var(--muted); margin-top: 0.2rem; }
+.doc-card .doc-score { color: var(--accent2); }
+
+/* ── Status badge ── */
+.badge {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 12px;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    margin-left: 0.4rem;
+}
+.badge-en  { background: rgba(88,166,255,0.15); color: #58a6ff; }
+.badge-ar  { background: rgba(210,153,34,0.15);  color: #d29922; }
+.badge-fr  { background: rgba(63,185,80,0.15);   color: #3fb950; }
+.badge-lib { background: rgba(63,185,80,0.15);   color: #3fb950; }
+.badge-con { background: rgba(248,81,73,0.15);   color: #f85149; }
+.badge-res { background: rgba(88,166,255,0.15);  color: #58a6ff; }
+</style>
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            doc_id          TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            institution     TEXT NOT NULL,
+            source_type     TEXT NOT NULL,
+            ideology_tag    TEXT NOT NULL,
+            language        TEXT NOT NULL,
+            pub_date        TEXT NOT NULL,
+            doc_type        TEXT NOT NULL,
+            episode         TEXT NOT NULL,
+            url             TEXT,
+            ai_status       TEXT DEFAULT 'unknown',
+            word_count      INTEGER,
+            full_text       TEXT NOT NULL,
+            -- Flattening rubric
+            agency_shift    INTEGER DEFAULT NULL,
+            uncert_deletion INTEGER DEFAULT NULL,
+            temp_compress   INTEGER DEFAULT NULL,
+            sec_reclass     INTEGER DEFAULT NULL,
+            flat_total      INTEGER DEFAULT NULL,
+            rater_1         TEXT DEFAULT NULL,
+            rater_2         TEXT DEFAULT NULL,
+            notes           TEXT,
+            created_at      TEXT NOT NULL
         )
+    """)
+    conn.commit()
+    conn.close()
 
-        st.divider()
+def doc_exists(doc_id: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
+    conn.close()
+    return row is not None
 
-        n = len(all_docs)
-        st.metric("Total documents", n)
-        st.metric("Total words", f"{sum(d.word_count for d in all_docs):,}")
+def insert_doc(data: dict) -> None:
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO documents
+        (doc_id, title, institution, source_type, ideology_tag, language,
+         pub_date, doc_type, episode, url, ai_status, word_count, full_text,
+         agency_shift, uncert_deletion, temp_compress, sec_reclass,
+         flat_total, rater_1, rater_2, notes, created_at)
+        VALUES
+        (:doc_id,:title,:institution,:source_type,:ideology_tag,:language,
+         :pub_date,:doc_type,:episode,:url,:ai_status,:word_count,:full_text,
+         :agency_shift,:uncert_deletion,:temp_compress,:sec_reclass,
+         :flat_total,:rater_1,:rater_2,:notes,:created_at)
+    """, data)
+    conn.commit()
+    conn.close()
 
-        if n > 0:
-            st.divider()
-            st.markdown("**By source type**")
-            src_counts: dict = {}
-            for d in all_docs:
-                src_counts[d.source_type] = src_counts.get(d.source_type, 0) + 1
-            for k, v in sorted(src_counts.items(), key=lambda x: -x[1]):
-                st.progress(v / n, text=f"{k}: {v}")
+def update_annotation(doc_id, d1, d2, d3, d4, rater, notes):
+    total = (d1 or 0) + (d2 or 0) + (d3 or 0) + (d4 or 0)
+    conn = get_db()
+    conn.execute("""
+        UPDATE documents SET
+            agency_shift=?, uncert_deletion=?, temp_compress=?, sec_reclass=?,
+            flat_total=?, rater_1=?, notes=?
+        WHERE doc_id=?
+    """, (d1, d2, d3, d4, total, rater, notes, doc_id))
+    conn.commit()
+    conn.close()
 
-        st.divider()
-        st.caption("Mohamed Defaa · PhD · Cyber Leadership")
-        st.caption("Capitol Technology University")
-        st.caption("Chair: Dr. Anthony Dehnashi")
-        st.caption(f"DB: `algpivot_corpus.db`")
+def get_all_docs():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM documents ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
-    return episode
+def get_stats():
+    conn = get_db()
+    total  = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    by_lang= conn.execute("SELECT language, COUNT(*) n FROM documents GROUP BY language").fetchall()
+    by_ep  = conn.execute("SELECT episode, COUNT(*) n FROM documents GROUP BY episode").fetchall()
+    by_ideo= conn.execute("SELECT ideology_tag, COUNT(*) n FROM documents GROUP BY ideology_tag").fetchall()
+    annotated = conn.execute("SELECT COUNT(*) FROM documents WHERE flat_total IS NOT NULL").fetchone()[0]
+    conn.close()
+    return {"total": total, "by_lang": by_lang, "by_ep": by_ep,
+            "by_ideo": by_ideo, "annotated": annotated}
 
+def delete_doc(doc_id):
+    conn = get_db()
+    conn.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
+    conn.commit()
+    conn.close()
 
-# ── DOCUMENT FORM ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def check_password(pw: str) -> bool:
+    correct = APP_PASSWORD.encode()
+    return hmac.compare_digest(hashlib.sha256(pw.encode()).digest(),
+                               hashlib.sha256(correct).digest())
 
-def _doc_form(
-    prefix: str,
-    defaults: Document,
-    existing_ids: Set[str],
-    editing: bool = False,
-) -> Optional[Document]:
-    """Render the document metadata and text form.
+def word_count(text: str) -> int:
+    return len(re.findall(r'\S+', text))
 
-    Uses direct widgets (no st.form) so word count updates live and
-    institution autofill fires immediately on selection.
+def generate_doc_id(inst_code, pub_date, lang, seq=None):
+    """Format: InstitutionCode_YYYYMM_lang_###"""
+    ym = pub_date.replace("-", "")[:6]
+    if seq is None:
+        conn = get_db()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE doc_id LIKE ?",
+            (f"{inst_code}_{ym}_{lang}_%",)
+        ).fetchone()[0]
+        conn.close()
+        seq = count + 1
+    return f"{inst_code}_{ym}_{lang}_{seq:03d}"
 
-    Parameters
-    ----------
-    prefix:
-        Unique string prepended to every widget key to avoid collisions.
-    defaults:
-        Pre-populated field values.
-    existing_ids:
-        All doc_ids currently in the database (for uniqueness validation).
-    editing:
-        True when modifying an existing document (skips ID uniqueness check
-        for the document's own ID).
-
-    Returns
-    -------
-    Optional[Document]
-        The assembled Document on successful save, or None otherwise.
-    """
-    inst_names = ["-- select institution --"] + sorted(INSTITUTION_AUTOFILL.keys())
-    inst = st.selectbox("Institution autofill", inst_names, key=f"{prefix}_inst")
-    if inst != "-- select institution --":
-        defaults.source_name  = inst
-        defaults.source_type  = INSTITUTION_AUTOFILL[inst][0]
-        defaults.ideology_tag = INSTITUTION_AUTOFILL[inst][1]
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown('<p class="lbl">Identification</p>', unsafe_allow_html=True)
-        title = st.text_input("Title", value=defaults.title, key=f"{prefix}_title")
-        doc_id = st.text_input(
-            "Document ID",
-            value=(
-                defaults.doc_id
-                if editing
-                else suggest_id(defaults.source_name, defaults.publication_date, existing_ids)
-            ),
-            key=f"{prefix}_id",
-        )
-        src_name = st.text_input(
-            "Source / Institution", value=defaults.source_name, key=f"{prefix}_src"
-        )
-        pub_date = st.text_input(
-            "Publication date (YYYY-MM-DD)",
-            value=defaults.publication_date,
-            key=f"{prefix}_date",
-        )
-        url = st.text_input("URL", value=defaults.url, key=f"{prefix}_url")
-
-    with c2:
-        st.markdown('<p class="lbl">Classification</p>', unsafe_allow_html=True)
-        episode  = st.selectbox(
-            "Episode", EPISODES,
-            index=_idx(EPISODES, defaults.episode), key=f"{prefix}_episode"
-        )
-        theme    = st.selectbox(
-            "Research theme", RESEARCH_THEMES,
-            index=_idx(RESEARCH_THEMES, defaults.research_theme), key=f"{prefix}_theme"
-        )
-        region   = st.selectbox(
-            "Region", REGIONS,
-            index=_idx(REGIONS, defaults.region), key=f"{prefix}_region"
-        )
-        lang     = st.selectbox(
-            "Language", LANGUAGES,
-            index=_idx(LANGUAGES, defaults.language), key=f"{prefix}_lang"
-        )
-        src_type = st.selectbox(
-            "Source type", SOURCE_TYPES,
-            index=_idx(SOURCE_TYPES, defaults.source_type), key=f"{prefix}_srctype"
-        )
-        ideology = st.selectbox(
-            "Ideology tag", IDEOLOGY_TAGS,
-            index=_idx(IDEOLOGY_TAGS, defaults.ideology_tag), key=f"{prefix}_ideo"
-        )
-        period   = st.selectbox(
-            "Period", PERIODS,
-            index=_idx(PERIODS, defaults.period), key=f"{prefix}_period"
-        )
-        actor    = st.selectbox(
-            "QUADRAD actor", QUADRAD_ACTORS,
-            index=_idx(QUADRAD_ACTORS, defaults.quadrad_actor), key=f"{prefix}_actor"
-        )
-
-    notes = st.text_area("Notes", value=defaults.notes, height=70, key=f"{prefix}_notes")
-    st.markdown('<p class="lbl">Document text</p>', unsafe_allow_html=True)
-    text = st.text_area(
-        "Text",
-        value=defaults.text,
-        height=240,
-        key=f"{prefix}_text",
-        label_visibility="collapsed",
-    )
-    count = wc(text)
-    st.caption(f"{'🟢' if count >= MIN_WORDS else '🟡'} {count:,} words")
-
-    if st.button("Save document", type="primary", key=f"{prefix}_save"):
-        doc = Document(
-            doc_id=doc_id.strip(),
-            title=title.strip(),
-            text=text.strip(),
-            episode=episode,
-            research_theme=theme,
-            region=region,
-            period=period,
-            language=lang,
-            source_type=src_type,
-            source_name=src_name.strip(),
-            ideology_tag=ideology,
-            quadrad_actor=actor,
-            publication_date=pub_date.strip(),
-            url=url.strip() or "NA",
-            notes=notes.strip(),
-            word_count=count,
-            added_at=defaults.added_at or datetime.datetime.utcnow().isoformat(),
-        )
-        errs, warns = validate(
-            doc,
-            existing_ids,
-            editing_id=defaults.doc_id if editing else "",
-        )
-        if errs:
-            for e in errs:
-                st.error(f"ERROR: {e}")
-            return None
-        for w in warns:
-            st.warning(f"WARNING: {w}")
-        return doc
-
-    return None
-
-
-# ── TAB: ADD ──────────────────────────────────────────────────────────────────
-
-
-def _tab_add(episode: str, existing_ids: Set[str]) -> None:
-    """Render the Add Document tab.
-
-    Parameters
-    ----------
-    episode:
-        The globally selected episode; pre-populates the episode field.
-    existing_ids:
-        All current doc_ids for uniqueness checking and ID suggestion.
-    """
-    st.markdown("### Add a new document")
-    method = st.radio(
-        "",
-        ["Paste text", "Scrape URL", "Upload PDF"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="add_method",
-    )
-    st.divider()
-
-    default_episode = episode if episode != "All" else "Syrian_Transition"
-    prefilled = Document(episode=default_episode)
-
-    if method == "Scrape URL":
-        url_in = st.text_input(
-            "URL to scrape",
-            placeholder="https://brookings.edu/...",
-            key="add_url_in",
-        )
-        if st.button("Fetch", key="add_fetch") and url_in.strip():
-            with st.spinner("Fetching..."):
-                try:
-                    t, txt = scrape_url(url_in.strip())
-                    st.session_state.update(
-                        {"add_s_title": t, "add_s_text": txt, "add_s_url": url_in.strip()}
-                    )
-                    st.success(f"Fetched {wc(txt):,} words.")
-                except requests.RequestException as exc:
-                    st.error(f"Fetch failed: {exc}")
-        if "add_s_text" in st.session_state:
-            with st.expander("Preview fetched text"):
-                st.text(st.session_state["add_s_text"][:1500] + "...")
-            prefilled.text  = st.session_state.get("add_s_text", "")
-            prefilled.title = st.session_state.get("add_s_title", "")
-            prefilled.url   = st.session_state.get("add_s_url", "NA")
-
-    elif method == "Upload PDF":
-        pdf = st.file_uploader("Upload PDF", type=["pdf"], key="add_pdf")
-        if pdf:
-            with st.spinner("Extracting text..."):
-                try:
-                    txt = extract_pdf(pdf.read())
-                    st.session_state.update(
-                        {
-                            "add_p_text": txt,
-                            "add_p_title": pdf.name.replace(".pdf", ""),
-                        }
-                    )
-                    st.success(f"Extracted {wc(txt):,} words.")
-                except (ImportError, Exception) as exc:
-                    st.error(f"PDF extraction failed: {exc}")
-        if "add_p_text" in st.session_state:
-            with st.expander("Preview extracted text"):
-                st.text(st.session_state["add_p_text"][:1500] + "...")
-            prefilled.text  = st.session_state.get("add_p_text", "")
-            prefilled.title = st.session_state.get("add_p_title", "")
-
-    st.divider()
-    doc = _doc_form("add", prefilled, existing_ids)
-    if doc:
+def extract_pdf(file_bytes) -> str:
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
         try:
-            upsert_doc(doc)
-            st.success(f"'{doc.doc_id}' saved.")
-            for k in ["add_s_text", "add_s_title", "add_s_url", "add_p_text", "add_p_title"]:
-                st.session_state.pop(k, None)
-            st.rerun()
-        except sqlite3.Error as exc:
-            st.error(f"Database error: {exc}")
+            import PyPDF2
+            reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            return f"[PDF extraction failed: {e}]"
 
+def extract_docx(file_bytes) -> str:
+    try:
+        from docx import Document as DocxDoc
+        doc = DocxDoc(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        return f"[DOCX extraction failed: {e}]"
 
-# ── TAB: LIBRARY ──────────────────────────────────────────────────────────────
+def scrape_url(url: str) -> str:
+    if not SCRAPE_AVAILABLE:
+        return "[requests/beautifulsoup4 not installed]"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (research-bot ALG-PIVOT)"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script","style","nav","footer","header"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception as e:
+        return f"[Scrape failed: {e}]"
 
+def validate_doc(data: dict) -> tuple[list, list]:
+    """Returns (hard_errors, soft_warnings)."""
+    errors, warnings = [], []
+    if not data.get("doc_id"):
+        errors.append("Missing doc_id")
+    elif doc_exists(data["doc_id"]):
+        errors.append(f"Duplicate doc_id: {data['doc_id']}")
+    if not data.get("pub_date") or not re.match(r"\d{4}-\d{2}-\d{2}", data["pub_date"]):
+        errors.append("Missing or malformatted pub_date (YYYY-MM-DD)")
+    if data.get("language") not in ("en","ar","fr"):
+        errors.append("Invalid language code (must be en / ar / fr)")
+    if not data.get("source_type"):
+        errors.append("Missing source_type")
+    if data.get("ideology_tag") not in IDEOLOGIES:
+        errors.append("Invalid ideology_tag")
+    if data.get("source_type") in ("gov_agency","intl_org") and data.get("ideology_tag") != "NA":
+        errors.append("gov_agency / intl_org sources must have ideology_tag = NA")
+    wc = word_count(data.get("full_text",""))
+    if wc < 500:
+        if wc < 150:
+            errors.append(f"Text too short: {wc} words (minimum 500 for inclusion; hard block at 150)")
+        else:
+            warnings.append(f"Text is {wc} words (below 500-word inclusion minimum — flagged)")
+    if not data.get("url"):
+        warnings.append("No URL provided")
+    return errors, warnings
 
-def _tab_library(docs: List[Document], existing_ids: Set[str]) -> None:
-    """Render the Library tab with filtering and inline editing.
-
-    Parameters
-    ----------
-    docs:
-        Documents to display (already episode-filtered).
-    existing_ids:
-        All current doc_ids for validation inside edit forms.
-    """
+def docs_to_csv(docs: list) -> str:
     if not docs:
-        st.info("No documents yet. Go to **Add Document** to start.")
+        return ""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(docs[0].keys()))
+    writer.writeheader()
+    writer.writerows(docs)
+    return buf.getvalue()
+
+def docs_to_marc_context(docs: list) -> str:
+    out = []
+    for d in docs[:30]:
+        snippet = (d.get("full_text") or "")[:400].replace("\n"," ")
+        out.append(
+            f"[{d['doc_id']}] {d['institution']} | {d['language'].upper()} | "
+            f"{d['episode']} | {d['ideology_tag']}\n"
+            f"Title: {d['title']}\n"
+            f"Text excerpt: {snippet}...\n"
+        )
+    return "\n---\n".join(out)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTH GATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def auth_gate():
+    st.markdown(CSS, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown(
+            "<h1 style='text-align:center; font-size:1.1rem;'>CB-01 · Corpus Builder</h1>"
+            "<p style='text-align:center; color:#8b949e; font-family:IBM Plex Mono,monospace; font-size:0.75rem;'>"
+            "ALG-PIVOT · Mohamed Defaa · Capitol Technology University</p>",
+            unsafe_allow_html=True
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        pw = st.text_input("Access key", type="password", placeholder="Enter password")
+        if st.button("Authenticate", use_container_width=True):
+            if check_password(pw):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: INGEST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def page_ingest():
+    st.markdown("## ADD DOCUMENT")
+
+    # ── Institution autofill ──────────────────────────────────────────────────
+    inst_names = list(INSTITUTIONS.keys())
+    inst_label = st.selectbox("Institution", inst_names, key="inst_sel")
+    inst_data  = INSTITUTIONS[inst_label]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        source_type  = st.selectbox("Source type",  SOURCE_TYPES,
+                                    index=SOURCE_TYPES.index(inst_data["source_type"]),
+                                    key="src_type")
+    with col2:
+        ideology     = st.selectbox("Ideology tag", IDEOLOGIES,
+                                    index=IDEOLOGIES.index(inst_data["ideology"]),
+                                    key="ideology")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        lang_label   = st.selectbox("Language", list(LANGUAGES.keys()), key="lang")
+        language     = LANGUAGES[lang_label]
+    with col2:
+        episode      = st.selectbox("Episode", EPISODES, key="episode")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        pub_date     = st.text_input("Publication date (YYYY-MM-DD)",
+                                     value=datetime.date.today().strftime("%Y-%m-%d"),
+                                     key="pub_date")
+    with col2:
+        doc_type     = st.selectbox("Document type", DOC_TYPES, key="doc_type")
+
+    ai_status    = st.selectbox("AI status", ["unknown","ai_assisted","human_only","confirmed_ai"],
+                                key="ai_status")
+    title        = st.text_input("Document title", key="title")
+    url          = st.text_input("Source URL (optional)", key="url")
+
+    # ── Auto-generate doc_id ─────────────────────────────────────────────────
+    if pub_date and re.match(r"\d{4}-\d{2}", pub_date):
+        suggested_id = generate_doc_id(inst_data["code"], pub_date, language)
+    else:
+        suggested_id = ""
+    doc_id = st.text_input("Document ID (auto-generated, editable)", value=suggested_id, key="doc_id")
+
+    # ── Ingestion method tabs ─────────────────────────────────────────────────
+    st.markdown("### Text ingestion")
+    tab_paste, tab_upload, tab_scrape = st.tabs(["📋 Paste text", "📁 Upload file", "🌐 Scrape URL"])
+
+    full_text = ""
+
+    with tab_paste:
+        full_text_paste = st.text_area("Paste document text here", height=250, key="paste_text")
+        full_text = full_text_paste
+
+    with tab_upload:
+        uploaded = st.file_uploader("Upload PDF, DOCX, or TXT",
+                                    type=["pdf","docx","txt","md"],
+                                    key="file_upload")
+        if uploaded:
+            raw = uploaded.read()
+            if uploaded.name.endswith(".pdf"):
+                full_text = extract_pdf(raw)
+            elif uploaded.name.endswith(".docx"):
+                full_text = extract_docx(raw)
+            else:
+                full_text = raw.decode("utf-8", errors="replace")
+            st.success(f"Extracted {word_count(full_text):,} words from {uploaded.name}")
+            st.text_area("Extracted text (editable)", value=full_text, height=200, key="upload_preview")
+            full_text = st.session_state.get("upload_preview", full_text)
+
+    with tab_scrape:
+        scrape_url_input = st.text_input("URL to scrape", key="scrape_url_input")
+        if st.button("Scrape", key="scrape_btn"):
+            if scrape_url_input:
+                with st.spinner("Fetching…"):
+                    full_text = scrape_url(scrape_url_input)
+                st.success(f"Fetched {word_count(full_text):,} words")
+                st.text_area("Scraped text (editable)", value=full_text, height=200, key="scrape_preview")
+                full_text = st.session_state.get("scrape_preview", full_text)
+            else:
+                st.warning("Enter a URL first.")
+
+    # Resolve final text across tabs
+    active_text = (
+        st.session_state.get("scrape_preview")
+        or st.session_state.get("upload_preview")
+        or full_text_paste
+        or ""
+    )
+
+    notes = st.text_area("Notes (optional)", height=80, key="notes")
+
+    # ── Validate + Save ───────────────────────────────────────────────────────
+    col_v, col_s = st.columns([1, 1])
+    with col_v:
+        if st.button("✔ Validate", use_container_width=True):
+            data = dict(
+                doc_id=doc_id, title=title, institution=inst_label,
+                source_type=source_type, ideology_tag=ideology, language=language,
+                pub_date=pub_date, doc_type=doc_type, episode=episode,
+                url=url, ai_status=ai_status, word_count=word_count(active_text),
+                full_text=active_text, agency_shift=None, uncert_deletion=None,
+                temp_compress=None, sec_reclass=None, flat_total=None,
+                rater_1=None, rater_2=None, notes=notes,
+                created_at=datetime.datetime.utcnow().isoformat()
+            )
+            errors, warnings = validate_doc(data)
+            if errors:
+                for e in errors:
+                    st.error(f"✗ {e}")
+            else:
+                st.success("✓ Validation passed")
+            for w in warnings:
+                st.warning(f"⚠ {w}")
+            st.session_state["validated_data"] = data if not errors else None
+
+    with col_s:
+        if st.button("💾 Save to corpus", use_container_width=True, type="primary"):
+            data = dict(
+                doc_id=doc_id, title=title, institution=inst_label,
+                source_type=source_type, ideology_tag=ideology, language=language,
+                pub_date=pub_date, doc_type=doc_type, episode=episode,
+                url=url, ai_status=ai_status, word_count=word_count(active_text),
+                full_text=active_text, agency_shift=None, uncert_deletion=None,
+                temp_compress=None, sec_reclass=None, flat_total=None,
+                rater_1=None, rater_2=None, notes=notes,
+                created_at=datetime.datetime.utcnow().isoformat()
+            )
+            errors, warnings = validate_doc(data)
+            if errors:
+                for e in errors:
+                    st.error(f"✗ {e}")
+            else:
+                insert_doc(data)
+                st.success(f"✓ Saved: `{doc_id}` ({word_count(active_text):,} words)")
+                for w in warnings:
+                    st.warning(f"⚠ {w}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: CORPUS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def page_corpus():
+    st.markdown("## CORPUS BROWSER")
+    docs = get_all_docs()
+    if not docs:
+        st.info("No documents yet. Use the **Add** tab to ingest your first document.")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
-    f_theme = c1.selectbox("Theme",    ["All"] + RESEARCH_THEMES, key="lib_f_theme")
-    f_src   = c2.selectbox("Source",   ["All"] + SOURCE_TYPES,    key="lib_f_src")
-    f_lang  = c3.selectbox("Language", ["All"] + LANGUAGES,       key="lib_f_lang")
-    f_q     = c4.text_input("Search",  placeholder="keyword...",   key="lib_f_q")
+    # ── Filters ───────────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        f_lang = st.selectbox("Language", ["All","en","ar","fr"], key="f_lang")
+    with col2:
+        f_ep   = st.selectbox("Episode", ["All"] + EPISODES, key="f_ep")
+    with col3:
+        f_ideo = st.selectbox("Ideology", ["All"] + IDEOLOGIES, key="f_ideo")
 
     filtered = docs
-    if f_theme != "All":
-        filtered = [d for d in filtered if d.research_theme == f_theme]
-    if f_src != "All":
-        filtered = [d for d in filtered if d.source_type == f_src]
     if f_lang != "All":
-        filtered = [d for d in filtered if d.language == f_lang]
-    if f_q.strip():
-        q = f_q.lower()
-        filtered = [
-            d for d in filtered
-            if q in d.title.lower() or q in d.source_name.lower() or q in d.text.lower()
-        ]
+        filtered = [d for d in filtered if d["language"] == f_lang]
+    if f_ep != "All":
+        filtered = [d for d in filtered if d["episode"] == f_ep]
+    if f_ideo != "All":
+        filtered = [d for d in filtered if d["ideology_tag"] == f_ideo]
 
     st.caption(f"Showing {len(filtered)} of {len(docs)} documents")
-    st.divider()
 
     for d in filtered:
-        errs, warns = validate(d, existing_ids, editing_id=d.doc_id)
-        status_icon = "OK" if not errs else "ERR"
-        warn_badge  = f"  W:{len(warns)}" if warns else ""
-        label = f"[{status_icon}] {d.doc_id} -- {d.source_name} · {d.publication_date}{warn_badge}"
-
-        with st.expander(label):
-            ca, cb = st.columns([3, 1])
-            with ca:
-                st.markdown(f"**{d.title or '(no title)'}**")
-                st.caption(
-                    f"Source type: {d.source_type}  |  "
-                    f"Ideology: {d.ideology_tag}  |  "
-                    f"Language: {d.language}  |  "
-                    f"Region: {d.region}  |  "
-                    f"Period: {d.period}  |  "
-                    f"Words: {d.word_count:,}"
-                )
-                st.caption(
-                    f"Theme: {d.research_theme}  |  "
-                    f"QUADRAD: {d.quadrad_actor}  |  "
-                    f"Episode: {d.episode}"
-                )
-                if d.url and d.url != "NA":
-                    st.caption(f"URL: {d.url[:80]}")
-                if d.notes:
-                    st.caption(f"Notes: {d.notes}")
-                with st.expander("View text preview"):
-                    st.text(d.text[:800] + ("..." if len(d.text) > 800 else ""))
-            with cb:
-                for e in errs:
-                    st.error(e)
-                for w in warns:
-                    st.warning(w)
-                if st.button("Edit", key=f"lib_edit_{d.doc_id}"):
-                    st.session_state[f"lib_editing_{d.doc_id}"] = True
-                if st.button("Delete", key=f"lib_del_{d.doc_id}"):
-                    try:
-                        delete_doc(d.doc_id)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Delete failed: {exc}")
-
-            if st.session_state.get(f"lib_editing_{d.doc_id}"):
-                st.divider()
-                upd = _doc_form(f"lib_ed_{d.doc_id}", d, existing_ids, editing=True)
-                if upd:
-                    try:
-                        upsert_doc(upd)
-                        st.success("Updated.")
-                        st.session_state.pop(f"lib_editing_{d.doc_id}")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Save failed: {exc}")
-
-
-# ── TAB: FLATTENING AUDIT ─────────────────────────────────────────────────────
-
-
-def _tab_audit(docs: List[Document]) -> None:
-    """Render the Flattening Audit tab.
-
-    Raters score each document on four dimensions of algorithmic narrative
-    flattening (agency, uncertainty, temporal, security) using a 0-3 scale.
-    Total score is /12. Entries are persisted for Cohen's Kappa computation.
-
-    Parameters
-    ----------
-    docs:
-        Documents available for audit (already episode-filtered).
-    """
-    if not docs:
-        st.info("No documents to audit.")
-        return
-
-    st.markdown("### Flattening Audit")
-    st.caption(
-        "Score each document on four dimensions of algorithmic narrative flattening. "
-        "Scale: 0 = none · 1 = low · 2 = moderate · 3 = high. Total score: /12."
-    )
-    st.info(
-        "**Inter-rater reliability:** Have two raters score the same documents "
-        "independently. Export the audit CSV and compute Cohen's Kappa in R "
-        "(`irr::kappa2`) or Python (`sklearn.metrics.cohen_kappa_score`)."
-    )
-    st.divider()
-
-    # Document selector
-    doc_options = {
-        f"{d.doc_id} -- {d.source_name} ({d.publication_date})": d
-        for d in docs
-    }
-    selected_label = st.selectbox(
-        "Select document to audit", list(doc_options.keys()), key="audit_doc_select"
-    )
-    selected_doc = doc_options[selected_label]
-    existing_audits = list_audits(selected_doc.doc_id)
-
-    st.markdown(f"**{selected_doc.title or selected_doc.doc_id}**")
-    st.caption(
-        f"{selected_doc.source_name}  ·  {selected_doc.publication_date}  ·  "
-        f"{selected_doc.research_theme}  ·  {selected_doc.episode}"
-    )
-    with st.expander("Text preview"):
-        st.text(
-            selected_doc.text[:600] + ("..." if len(selected_doc.text) > 600 else "")
-        )
-
-    st.divider()
-    st.markdown("#### Rate this document")
-
-    rater = st.text_input(
-        "Rater initials (required)",
-        max_chars=10,
-        key="audit_rater",
-        placeholder="e.g. MD",
-    )
-
-    scores: dict = {}
-    for dim in AUDIT_DIMENSIONS:
-        rubric = AUDIT_RUBRIC[dim]
-        st.markdown(f"**{rubric['label']}**")
-        st.caption(rubric["description"])
-        anchor_md = "  ·  ".join(
-            f"**{k}** = {v}" for k, v in rubric["anchors"].items()
-        )
-        st.caption(anchor_md)
-        scores[dim] = st.slider(
-            rubric["label"],
-            min_value=0,
-            max_value=3,
-            value=0,
-            key=f"audit_slider_{dim}",
-            label_visibility="collapsed",
-        )
-        st.divider()
-
-    total = sum(scores.values())
-    severity = (
-        "Low flattening"       if total <= 3  else
-        "Moderate flattening"  if total <= 7  else
-        "High flattening"
-    )
-    c_score, c_sev = st.columns([1, 3])
-    c_score.metric("Total score", f"{total}/12")
-    c_sev.caption(f"Severity: **{severity}**")
-
-    audit_notes = st.text_area("Audit notes", height=80, key="audit_notes")
-
-    if st.button("Save audit entry", type="primary", key="audit_save"):
-        if not rater.strip():
-            st.error("Rater initials are required.")
+        lang_badge = f"<span class='badge badge-{d['language']}'>{d['language'].upper()}</span>"
+        if "liberal" in d["ideology_tag"]:
+            ideo_badge = f"<span class='badge badge-lib'>LIB</span>"
+        elif "conservative" in d["ideology_tag"]:
+            ideo_badge = f"<span class='badge badge-con'>CON</span>"
         else:
-            ts = datetime.datetime.utcnow()
-            audit_id = (
-                f"{selected_doc.doc_id}_{rater.strip()}_{ts.strftime('%Y%m%dT%H%M%S')}"
-            )
-            entry = AuditEntry(
-                audit_id=audit_id,
-                doc_id=selected_doc.doc_id,
-                rater=rater.strip(),
-                agency_score=scores["agency"],
-                uncertainty_score=scores["uncertainty"],
-                temporal_score=scores["temporal"],
-                security_score=scores["security"],
-                total_score=total,
-                notes=audit_notes.strip(),
-                rated_at=ts.isoformat(),
-            )
-            try:
-                upsert_audit(entry)
-                st.success(f"Audit saved. ID: {audit_id}")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Save failed: {exc}")
+            ideo_badge = f"<span class='badge badge-res'>{d['ideology_tag'][:3].upper()}</span>"
 
-    # Existing audit entries for this document
-    if existing_audits:
-        st.divider()
-        st.markdown(f"#### {len(existing_audits)} existing audit(s) for this document")
-        for e in existing_audits:
-            with st.expander(
-                f"Rater: {e.rater}  ·  Score: {e.total_score}/12  ·  {e.rated_at[:10]}"
-            ):
-                ca, cb, cc, cd = st.columns(4)
-                ca.metric("Agency",      e.agency_score)
-                cb.metric("Uncertainty", e.uncertainty_score)
-                cc.metric("Temporal",    e.temporal_score)
-                cd.metric("Security",    e.security_score)
-                if e.notes:
-                    st.caption(f"Notes: {e.notes}")
-                if st.button("Delete audit", key=f"audit_del_{e.audit_id}"):
-                    try:
-                        delete_audit(e.audit_id)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Delete failed: {exc}")
+        flat = f"<span class='doc-score'>Flat: {d['flat_total']}/12</span>" if d["flat_total"] is not None else "<span style='color:#8b949e'>Flat: —</span>"
 
+        st.markdown(
+            f"<div class='doc-card'>"
+            f"<span class='doc-id'>{d['doc_id']}</span>{lang_badge}{ideo_badge}"
+            f"<div class='doc-meta'>{d['institution']} · {d['episode']} · {d['pub_date']} · {d['word_count']:,} words · {flat}</div>"
+            f"<div class='doc-meta' style='margin-top:0.3rem'>{d['title'][:120]}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+        with st.expander(f"Details / Annotate — {d['doc_id']}"):
+            st.text_area("Full text", value=d["full_text"], height=180, key=f"txt_{d['doc_id']}", disabled=True)
+            st.markdown("**Flattening annotation** (0 = none, 3 = strong)")
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            with ac1:
+                d1 = st.selectbox("Agency Shift", [None,0,1,2,3],
+                                  index=([None,0,1,2,3].index(d["agency_shift"]) if d["agency_shift"] in [None,0,1,2,3] else 0),
+                                  key=f"d1_{d['doc_id']}")
+            with ac2:
+                d2 = st.selectbox("Uncert. Deletion", [None,0,1,2,3],
+                                  index=([None,0,1,2,3].index(d["uncert_deletion"]) if d["uncert_deletion"] in [None,0,1,2,3] else 0),
+                                  key=f"d2_{d['doc_id']}")
+            with ac3:
+                d3 = st.selectbox("Temporal Compress.", [None,0,1,2,3],
+                                  index=([None,0,1,2,3].index(d["temp_compress"]) if d["temp_compress"] in [None,0,1,2,3] else 0),
+                                  key=f"d3_{d['doc_id']}")
+            with ac4:
+                d4 = st.selectbox("Security Reclass.", [None,0,1,2,3],
+                                  index=([None,0,1,2,3].index(d["sec_reclass"]) if d["sec_reclass"] in [None,0,1,2,3] else 0),
+                                  key=f"d4_{d['doc_id']}")
+            rater = st.text_input("Rater initials", value=d["rater_1"] or "", key=f"rater_{d['doc_id']}")
+            annot_notes = st.text_area("Annotation notes", value=d["notes"] or "", height=60, key=f"anotes_{d['doc_id']}")
 
-# ── TAB: VALIDATE ─────────────────────────────────────────────────────────────
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                if st.button("Save annotation", key=f"save_ann_{d['doc_id']}"):
+                    update_annotation(d["doc_id"], d1, d2, d3, d4, rater, annot_notes)
+                    st.success("Annotation saved.")
+                    st.rerun()
+            with rc2:
+                if st.button("🗑 Delete document", key=f"del_{d['doc_id']}"):
+                    delete_doc(d["doc_id"])
+                    st.warning(f"Deleted {d['doc_id']}")
+                    st.rerun()
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: VALIDATE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _tab_validate(docs: List[Document], existing_ids: Set[str]) -> None:
-    """Render the Validate tab with corpus-wide error and warning counts.
-
-    Parameters
-    ----------
-    docs:
-        Documents to validate (already episode-filtered).
-    existing_ids:
-        All current doc_ids, used inside validate().
-    """
+def page_validate():
+    st.markdown("## CORPUS VALIDATION")
+    docs = get_all_docs()
     if not docs:
         st.info("No documents to validate.")
         return
 
-    results = {
-        d.doc_id: validate(d, existing_ids, editing_id=d.doc_id) for d in docs
-    }
-    total_e = sum(len(r[0]) for r in results.values())
-    total_w = sum(len(r[1]) for r in results.values())
+    total_errors, total_warnings = 0, 0
+    issues = []
+    for d in docs:
+        errors, warnings = [], []
+        if not d.get("title"):
+            warnings.append("Missing title")
+        if d.get("word_count", 0) < 500:
+            warnings.append(f"Under 500 words ({d['word_count']})")
+        if d.get("flat_total") is None:
+            warnings.append("Not yet annotated")
+        if not d.get("url"):
+            warnings.append("No URL")
+        if errors or warnings:
+            issues.append((d["doc_id"], errors, warnings))
+            total_errors   += len(errors)
+            total_warnings += len(warnings)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Documents", len(docs))
-    c2.metric("Errors",    total_e)
-    c3.metric("Warnings",  total_w)
-    st.divider()
+    c1.metric("Total documents", len(docs))
+    c2.metric("Hard errors",     total_errors,   delta=None)
+    c3.metric("Soft warnings",   total_warnings, delta=None)
 
-    if total_e == 0:
-        st.success("All documents passed validation -- corpus is export-ready.")
+    annotated = sum(1 for d in docs if d.get("flat_total") is not None)
+    st.progress(annotated / len(docs) if docs else 0,
+                text=f"Annotation progress: {annotated}/{len(docs)} documents")
+
+    if issues:
+        st.markdown("### Issues by document")
+        for doc_id, errors, warnings in issues:
+            with st.expander(f"{'🔴' if errors else '🟡'} {doc_id}"):
+                for e in errors:   st.error(e)
+                for w in warnings: st.warning(w)
     else:
-        st.error(f"{total_e} error(s) must be fixed before export.")
+        st.success("✓ No issues found.")
 
-    for doc_id, (errs, warns) in results.items():
-        if errs or warns:
-            prefix = "ERR" if errs else "WARN"
-            with st.expander(f"[{prefix}] {doc_id}"):
-                for e in errs:
-                    st.error(e)
-                for w in warns:
-                    st.warning(w)
+    # ── Kappa reminder ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Inter-rater reliability")
+    st.info(
+        "After both raters have scored the first 20 documents, compute Cohen's κ externally:\n\n"
+        "```python\nfrom sklearn.metrics import cohen_kappa_score\n"
+        "κ = cohen_kappa_score(rater1_scores, rater2_scores)\n```\n\n"
+        "Minimum κ ≥ 0.70 required on all four dimensions before full annotation."
+    )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: EXPORT
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── TAB: EXPORT ───────────────────────────────────────────────────────────────
+def page_export():
+    st.markdown("## EXPORT")
+    docs = get_all_docs()
+    stats = get_stats()
 
+    # ── Corpus stats ─────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",      stats["total"])
+    c2.metric("Annotated",  stats["annotated"])
+    c3.metric("Languages",  len(stats["by_lang"]))
+    c4.metric("Episodes",   len(stats["by_ep"]))
 
-def _tab_export(docs: List[Document], existing_ids: Set[str]) -> None:
-    """Render the Export tab.
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**By language**")
+        for row in stats["by_lang"]:
+            st.caption(f"{row[0].upper()}: {row[1]}")
+    with col_b:
+        st.markdown("**By ideology**")
+        for row in stats["by_ideo"]:
+            st.caption(f"{row[0]}: {row[1]}")
 
-    Export is blocked when any document has validation errors.
+    st.markdown("---")
 
-    Parameters
-    ----------
-    docs:
-        Documents to export (already episode-filtered).
-    existing_ids:
-        All current doc_ids, used inside validate().
-    """
     if not docs:
         st.info("No documents to export.")
         return
 
-    has_errors = any(
-        validate(d, existing_ids, editing_id=d.doc_id)[0] for d in docs
-    )
+    col1, col2 = st.columns(2)
 
-    st.markdown("### Export corpus")
-    st.caption(
-        f"{len(docs)} documents · {sum(d.word_count for d in docs):,} total words"
-    )
-    st.divider()
-
-    # ── CSV
-    st.markdown("**Corpus CSV**")
-    include_text = st.checkbox("Include full text column", key="exp_include_text")
-    if has_errors:
-        st.error("Fix all validation errors before exporting.")
-    else:
-        csv_data = to_csv(docs, include_text=include_text)
+    with col1:
+        st.markdown("### Full corpus CSV")
+        csv_data = docs_to_csv(docs)
         st.download_button(
-            "Download corpus.csv",
+            "⬇ Download corpus.csv",
             data=csv_data,
-            file_name=f"algpivot_corpus_{datetime.date.today()}.csv",
+            file_name=f"alg_pivot_corpus_{datetime.date.today()}.csv",
             mime="text/csv",
-            type="primary",
+            use_container_width=True
         )
 
-    st.divider()
-
-    # ── Audit CSV
-    st.markdown("**Audit scores CSV (for Cohen's Kappa)**")
-    all_audits = list_audits()
-    if all_audits:
+    with col2:
+        st.markdown("### MARC-02 context block")
+        marc_block = docs_to_marc_context(docs)
         st.download_button(
-            "Download audit_scores.csv",
-            data=audit_to_csv(all_audits),
-            file_name=f"algpivot_audits_{datetime.date.today()}.csv",
+            "⬇ Download marc_context.txt",
+            data=marc_block,
+            file_name=f"marc_context_{datetime.date.today()}.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+        st.caption("First 30 documents · 400 char excerpt each · ready for MARC-02 context field")
+
+    st.markdown("---")
+    st.markdown("### Annotation audit CSV")
+    annotated = [d for d in docs if d.get("flat_total") is not None]
+    if annotated:
+        audit_csv = docs_to_csv(annotated)
+        st.download_button(
+            "⬇ Download annotation_audit.csv",
+            data=audit_csv,
+            file_name=f"annotation_audit_{datetime.date.today()}.csv",
             mime="text/csv",
+            use_container_width=True
         )
-        st.caption(f"{len(all_audits)} audit entries across all documents.")
     else:
-        st.caption("No audit entries yet.")
+        st.info("No annotated documents yet.")
 
-    st.divider()
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: STATS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # ── MARC-02 context block
-    st.markdown("**MARC-02 context block**")
-    t_filter = st.selectbox(
-        "Filter by theme", ["All"] + RESEARCH_THEMES, key="exp_ctx_theme"
+def page_stats():
+    st.markdown("## CORPUS STATISTICS")
+    stats = get_stats()
+    docs  = get_all_docs()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total documents",  stats["total"])
+    c2.metric("Annotated",        stats["annotated"])
+    c3.metric("Target",           "1,500")
+
+    st.progress(stats["total"] / 1500, text=f"Corpus completion: {stats['total']}/1500")
+
+    col_l, col_e, col_i = st.columns(3)
+    with col_l:
+        st.markdown("**Language distribution**")
+        for r in stats["by_lang"]:
+            st.caption(f"`{r[0].upper()}` — {r[1]} docs")
+    with col_e:
+        st.markdown("**Episode distribution**")
+        for r in stats["by_ep"]:
+            st.caption(f"`{r[0]}` — {r[1]} docs")
+    with col_i:
+        st.markdown("**Ideology distribution**")
+        for r in stats["by_ideo"]:
+            st.caption(f"`{r[0]}` — {r[1]} docs")
+
+    if stats["annotated"] > 0:
+        st.markdown("---")
+        st.markdown("**Flattening score distribution**")
+        annotated = [d for d in docs if d.get("flat_total") is not None]
+        low    = sum(1 for d in annotated if d["flat_total"] <= 3)
+        mid    = sum(1 for d in annotated if 4 <= d["flat_total"] <= 7)
+        high   = sum(1 for d in annotated if d["flat_total"] >= 8)
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Low (0–3)",      low)
+        cc2.metric("Moderate (4–7)", mid)
+        cc3.metric("High (8–12)",    high)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    st.set_page_config(
+        page_title="CB-01 · ALG-PIVOT Corpus Builder",
+        page_icon="📚",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
-    ctx_docs = docs if t_filter == "All" else [d for d in docs if d.research_theme == t_filter]
-    if st.button("Generate context block", key="exp_ctx_btn"):
-        block = to_context_block(ctx_docs, topic_filter=t_filter)
-        st.text_area(
-            "Paste into MARC-02 Context field:",
-            value=block,
-            height=300,
-            key="exp_ctx_out",
+    st.markdown(CSS, unsafe_allow_html=True)
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+    if not st.session_state.get("authenticated"):
+        auth_gate()
+
+    init_db()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown(
+            "<div style='font-family:IBM Plex Mono,monospace; font-size:1rem; "
+            "color:#58a6ff; font-weight:600; margin-bottom:0.2rem'>CB-01</div>"
+            "<div style='font-family:IBM Plex Mono,monospace; font-size:0.65rem; "
+            "color:#8b949e; margin-bottom:1.5rem'>CORPUS BUILDER · ALG-PIVOT</div>",
+            unsafe_allow_html=True
         )
-        st.caption(f"First 30 docs · {wc(block):,} words")
+        stats = get_stats()
+        st.metric("Corpus size", stats["total"])
+        st.metric("Annotated",   stats["annotated"])
+        st.markdown("---")
+        nav = st.radio(
+            "Navigation",
+            ["Add document", "Corpus browser", "Validate", "Export", "Statistics"],
+            key="nav"
+        )
+        st.markdown("---")
+        if st.button("🔒 Lock", use_container_width=True):
+            st.session_state["authenticated"] = False
+            st.rerun()
+        st.caption(f"DB: `{os.path.basename(DB_PATH)}`")
 
-    st.divider()
-
-    # ── Corpus statistics
-    st.markdown("**Corpus statistics**")
-    try:
-        import pandas as pd
-
-        stats = corpus_stats(docs)
-        ca, cb = st.columns(2)
-
-        with ca:
-            st.caption("By source type")
-            st.dataframe(
-                pd.DataFrame(
-                    list(stats["by_source_type"].items()), columns=["Source type", "Count"]
-                ).sort_values("Count", ascending=False),
-                hide_index=True,
-                use_container_width=True,
-            )
-            st.caption("By research theme")
-            st.dataframe(
-                pd.DataFrame(
-                    list(stats["by_theme"].items()), columns=["Theme", "Count"]
-                ).sort_values("Count", ascending=False),
-                hide_index=True,
-                use_container_width=True,
-            )
-
-        with cb:
-            st.caption("By language")
-            st.dataframe(
-                pd.DataFrame(
-                    list(stats["by_language"].items()), columns=["Language", "Count"]
-                ).sort_values("Count", ascending=False),
-                hide_index=True,
-                use_container_width=True,
-            )
-            st.caption("By episode")
-            st.dataframe(
-                pd.DataFrame(
-                    list(stats["by_episode"].items()), columns=["Episode", "Count"]
-                ).sort_values("Count", ascending=False),
-                hide_index=True,
-                use_container_width=True,
-            )
-    except ImportError:
-        st.warning("Install pandas to enable statistics tables (`pip install pandas`).")
-
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-    """Application entry point."""
-    import sqlite3  # needed for the error type in _tab_add
-
-    # Load unfiltered docs for sidebar metrics, then apply episode filter
-    all_docs = list_docs()
-    episode  = _render_sidebar(all_docs)
-    docs     = list_docs(episode)
-    ids      = all_ids()
-
-    st.markdown("## Corpus Builder")
-    st.caption("MARC-03 · Multi-Agent Research Corpus Manager")
-    if episode != "All":
-        st.caption(f"Episode filter active: **{episode}**")
-
-    tab_add, tab_lib, tab_fla, tab_val, tab_exp = st.tabs([
-        "Add Document",
-        "Library",
-        "Flattening Audit",
-        "Validate",
-        "Export",
-    ])
-
-    with tab_add:
-        _tab_add(episode, ids)
-    with tab_lib:
-        _tab_library(docs, ids)
-    with tab_fla:
-        _tab_audit(docs)
-    with tab_val:
-        _tab_validate(docs, ids)
-    with tab_exp:
-        _tab_export(docs, ids)
-
+    # ── Page routing ──────────────────────────────────────────────────────────
+    if nav == "Add document":
+        page_ingest()
+    elif nav == "Corpus browser":
+        page_corpus()
+    elif nav == "Validate":
+        page_validate()
+    elif nav == "Export":
+        page_export()
+    elif nav == "Statistics":
+        page_stats()
 
 if __name__ == "__main__":
     main()
