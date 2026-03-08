@@ -44,7 +44,8 @@ except ImportError:
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_PASSWORD = os.environ.get("CB01_PASSWORD", "algpivot2026")
+APP_PASSWORD  = os.environ.get("CB01_PASSWORD", "algpivot2026")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 
 DB_PATH = os.environ.get("CB01_DB_PATH",
     "/data/corpus.db" if os.path.isdir("/data") else "corpus.db"
@@ -440,6 +441,35 @@ def scrape_url(url: str) -> str:
         return soup.get_text(separator="\n", strip=True)
     except Exception as e:
         return f"[Scrape failed: {e}]"
+
+def brave_search(query: str, count: int = 20) -> list:
+    """Search Brave and return list of result dicts."""
+    if not BRAVE_API_KEY:
+        return []
+    try:
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
+        }
+        params = {"q": query, "count": min(count, 20), "text_decorations": False}
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers, params=params, timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for r in data.get("web", {}).get("results", []):
+            results.append({
+                "title":       r.get("title", ""),
+                "url":         r.get("url", ""),
+                "description": r.get("description", ""),
+                "age":         r.get("age", ""),
+            })
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]
 
 def validate_doc(data: dict) -> tuple[list, list]:
     """Returns (hard_errors, soft_warnings)."""
@@ -912,6 +942,218 @@ def page_stats():
         cc3.metric("High (8–12)",    high)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: SEARCH & DISCOVER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Institution → domain hint for search query construction
+INST_DOMAINS = {
+    "Brookings": "brookings.edu",
+    "CAP":       "americanprogress.org",
+    "Carnegie":  "carnegieendowment.org",
+    "Heritage":  "heritage.org",
+    "AEI":       "aei.org",
+    "Hudson":    "hudson.org",
+    "FDD":       "fdd.org",
+    "Quincy":    "quincyinst.org",
+    "AtlanticC": "atlanticcouncil.org",
+    "Wilson":    "wilsoncenter.org",
+    "Other":     "",
+}
+
+SCRAPE_BLOCKED = {"Brookings", "Heritage", "Carnegie", "AEI", "Hudson", "CAP"}
+
+def page_search():
+    st.markdown("## SEARCH & DISCOVER")
+
+    if not BRAVE_API_KEY:
+        st.error("BRAVE_API_KEY environment variable not set. Add it to Render and redeploy.")
+        return
+
+    st.caption("Keyword search powered by Brave Search API · Results ranked by relevance")
+
+    # ── Query builder ─────────────────────────────────────────────────────────
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        keywords = st.text_input(
+            "Keywords",
+            placeholder='e.g. "Syria reconstruction 2024" or "normalization Saudi Arabia Turkey"',
+            key="search_keywords"
+        )
+    with col2:
+        result_count = st.selectbox("Results", [10, 20], index=1, key="result_count")
+
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        filter_inst = st.selectbox(
+            "Limit to institution",
+            ["Any institution"] + list(INSTITUTIONS.keys()),
+            key="filter_inst"
+        )
+    with col4:
+        filter_lang = st.selectbox(
+            "Language hint",
+            ["Any", "English", "Arabic", "French"],
+            key="filter_lang"
+        )
+    with col5:
+        filter_year = st.selectbox(
+            "Year",
+            ["Any", "2023", "2024", "2025", "2026"],
+            key="filter_year"
+        )
+
+    # ── Build query ───────────────────────────────────────────────────────────
+    def build_query():
+        q = keywords.strip()
+        if filter_inst != "Any institution" and filter_inst in INST_DOMAINS:
+            domain = INST_DOMAINS[filter_inst]
+            if domain:
+                q += f" site:{domain}"
+        if filter_year != "Any":
+            q += f" {filter_year}"
+        if filter_lang == "Arabic":
+            q += " Arabic language"
+        elif filter_lang == "French":
+            q += " French language"
+        return q
+
+    if keywords:
+        st.caption(f"Query: `{build_query()}`")
+
+    # ── Search ────────────────────────────────────────────────────────────────
+    if st.button("🔍 Search", type="primary", use_container_width=False, key="search_btn"):
+        if not keywords.strip():
+            st.warning("Enter keywords first.")
+        else:
+            with st.spinner("Searching…"):
+                results = brave_search(build_query(), count=result_count)
+            st.session_state["search_results"] = results
+            st.session_state["queued_urls"] = st.session_state.get("queued_urls", [])
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    results = st.session_state.get("search_results", [])
+
+    if results:
+        if results and "error" in results[0]:
+            st.error(f"Search error: {results[0]['error']}")
+        else:
+            st.markdown(f"### {len(results)} results")
+
+            queued = st.session_state.get("queued_urls", [])
+
+            for i, r in enumerate(results):
+                already_in_corpus = False
+                conn = get_db()
+                row = conn.execute("SELECT doc_id FROM documents WHERE url=?", (r["url"],)).fetchone()
+                conn.close()
+                if row:
+                    already_in_corpus = True
+
+                already_queued = r["url"] in [q["url"] for q in queued]
+
+                # Detect if domain is scrape-blocked
+                blocked = any(dom.lower() in r["url"].lower()
+                              for dom in ["brookings.edu","heritage.org",
+                                          "carnegieendowment.org","aei.org",
+                                          "hudson.org","americanprogress.org"])
+
+                with st.container():
+                    st.markdown(
+                        f"<div class='doc-card'>"
+                        f"<span class='doc-id'>{r['title'][:90]}</span>"
+                        f"<div class='doc-meta'><a href='{r['url']}' target='_blank' "
+                        f"style='color:#58a6ff'>{r['url'][:80]}</a></div>"
+                        f"<div class='doc-meta' style='margin-top:0.3rem'>{r.get('description','')[:180]}</div>"
+                        f"{'<div class=\"doc-meta\" style=\"color:#d29922\">⚠ Scraper blocked — PDF upload required</div>' if blocked else ''}"
+                        f"{'<div class=\"doc-meta\" style=\"color:#3fb950\">✓ Already in corpus</div>' if already_in_corpus else ''}"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    if not already_in_corpus:
+                        bc1, bc2 = st.columns([1, 4])
+                        with bc1:
+                            if already_queued:
+                                st.success("Queued ✓")
+                            else:
+                                if st.button("+ Queue", key=f"queue_{i}"):
+                                    queued.append({
+                                        "url":   r["url"],
+                                        "title": r["title"],
+                                        "blocked": blocked,
+                                    })
+                                    st.session_state["queued_urls"] = queued
+                                    st.rerun()
+
+            # ── Queue panel ───────────────────────────────────────────────────
+            if queued:
+                st.markdown("---")
+                st.markdown(f"### Ingestion queue — {len(queued)} URLs")
+                st.caption("Unblocked URLs will be scraped automatically. Blocked sites require PDF upload in the Add document tab.")
+
+                for j, q in enumerate(queued):
+                    qc1, qc2 = st.columns([5, 1])
+                    with qc1:
+                        icon = "⚠" if q["blocked"] else "✓"
+                        status_html = "<div class='doc-meta' style='color:#d29922'>PDF upload required</div>" if q["blocked"] else "<div class='doc-meta' style='color:#3fb950'>Auto-scrape available</div>"
+                        st.markdown(
+                            f"<div class='doc-card'>"
+                            f"<span class='doc-id'>{icon} {q['title'][:70]}</span>"
+                            f"<div class='doc-meta'>{q['url'][:90]}</div>"
+                            f"{status_html}"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                    with qc2:
+                        if st.button("Remove", key=f"dequeue_{j}"):
+                            queued.pop(j)
+                            st.session_state["queued_urls"] = queued
+                            st.rerun()
+
+                st.markdown("#### Auto-scrape unblocked URLs")
+                st.caption("This will attempt to scrape all non-blocked queued URLs and pre-fill the Add document form. You will still need to complete metadata and save each one.")
+
+                unblocked = [q for q in queued if not q["blocked"]]
+                blocked_q  = [q for q in queued if q["blocked"]]
+
+                if unblocked:
+                    if st.button(f"🌐 Scrape {len(unblocked)} unblocked URL(s)", type="primary"):
+                        scraped = []
+                        for q in unblocked:
+                            with st.spinner(f"Scraping {q['url'][:50]}…"):
+                                text = scrape_url(q["url"])
+                                wc   = word_count(text)
+                                scraped.append({**q, "text": text, "word_count": wc})
+                        st.session_state["scraped_batch"] = scraped
+                        st.success(f"Scraped {len(scraped)} documents. Review below.")
+
+                    batch = st.session_state.get("scraped_batch", [])
+                    for s in batch:
+                        with st.expander(f"📄 {s['title'][:60]} — {s['word_count']:,} words"):
+                            st.text_area("Extracted text", value=s["text"], height=150,
+                                        key=f"batch_txt_{s['url'][-20:]}", disabled=True)
+                            st.caption(f"URL: {s['url']}")
+                            st.info("Go to **Add document** tab, paste this URL in the Scrape field, complete metadata, and save.")
+
+                if blocked_q:
+                    st.markdown("#### Blocked sites — manual PDF download required")
+                    for q in blocked_q:
+                        st.markdown(
+                            f"<div class='doc-card'>"
+                            f"<span class='doc-id'>⬇ {q['title'][:70]}</span>"
+                            f"<div class='doc-meta'>"
+                            f"<a href='{q['url']}' target='_blank' style='color:#58a6ff'>Open page →</a>"
+                            f" · Download PDF · Upload via Add document tab"
+                            f"</div></div>",
+                            unsafe_allow_html=True
+                        )
+
+                if st.button("🗑 Clear queue", key="clear_queue"):
+                    st.session_state["queued_urls"] = []
+                    st.session_state["scraped_batch"] = []
+                    st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -945,7 +1187,7 @@ def main():
         st.markdown("---")
         nav = st.radio(
             "Navigation",
-            ["Add document", "Corpus browser", "Validate", "Export", "Statistics"],
+            ["Search & Discover", "Add document", "Corpus browser", "Validate", "Export", "Statistics"],
             key="nav"
         )
         st.markdown("---")
@@ -955,7 +1197,9 @@ def main():
         st.caption(f"DB: `{os.path.basename(DB_PATH)}`")
 
     # ── Page routing ──────────────────────────────────────────────────────────
-    if nav == "Add document":
+    if nav == "Search & Discover":
+        page_search()
+    elif nav == "Add document":
         page_ingest()
     elif nav == "Corpus browser":
         page_corpus()
