@@ -40,6 +40,12 @@ try:
 except ImportError:
     DOCX_AVAILABLE = False
 
+try:
+    from langdetect import detect as langdetect_detect, LangDetectException
+    LANGDETECT_AVAILABLE = True
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -77,7 +83,7 @@ SOURCE_TYPES = ["think_tank", "government", "ngo", "academic", "media", "intl_or
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&family=Noto+Sans+Arabic:wght@300;400;500;600&family=Noto+Sans:wght@300;400;500;600&display=swap');
 
 /* ── Root ── */
 :root {
@@ -249,6 +255,41 @@ hr { border-color: var(--border) !important; margin: 1rem 0; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ── Arabic RTL text rendering ── */
+.rtl-text {
+    direction: rtl !important;
+    text-align: right !important;
+    font-family: 'Noto Sans Arabic', 'IBM Plex Sans', sans-serif !important;
+    font-size: 1rem !important;
+    line-height: 1.8 !important;
+    unicode-bidi: embed !important;
+}
+
+/* ── French / Latin text rendering ── */
+.fr-text {
+    font-family: 'Noto Sans', 'IBM Plex Sans', sans-serif !important;
+    line-height: 1.7 !important;
+}
+
+/* ── Language flag badges ── */
+.lang-flag {
+    display: inline-block;
+    padding: 0.15rem 0.6rem;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+}
+.lang-en { background: rgba(88,166,255,0.12); color: #58a6ff; border: 1px solid rgba(88,166,255,0.3); }
+.lang-ar { background: rgba(210,153,34,0.12);  color: #d29922; border: 1px solid rgba(210,153,34,0.3); }
+.lang-fr { background: rgba(63,185,80,0.12);   color: #3fb950; border: 1px solid rgba(63,185,80,0.3); }
+
+/* ── Language detection result ── */
+.lang-match   { color: #3fb950; font-family: var(--mono); font-size: 0.78rem; }
+.lang-mismatch { color: #f85149; font-family: var(--mono); font-size: 0.78rem; font-weight: 600; }
+.lang-unknown  { color: #8b949e; font-family: var(--mono); font-size: 0.78rem; }
 
 /* ── Doc card ── */
 .doc-card {
@@ -471,6 +512,74 @@ def brave_search(query: str, count: int = 20) -> list:
     except Exception as e:
         return [{"error": str(e)}]
 
+def detect_language(text: str) -> str:
+    """Detect language of text. Returns ISO 639-1 code or 'unknown'."""
+    if not LANGDETECT_AVAILABLE or not text or len(text.strip()) < 50:
+        return "unknown"
+    try:
+        # Normalize: langdetect returns 'ar', 'fr', 'en' etc.
+        detected = langdetect_detect(text[:2000])
+        # Map to our three supported codes
+        if detected == "ar":
+            return "ar"
+        elif detected == "fr":
+            return "fr"
+        elif detected in ("en", "en-US", "en-GB"):
+            return "en"
+        else:
+            return detected  # Return whatever was detected for transparency
+    except Exception:
+        return "unknown"
+
+def render_text_preview(text: str, language: str, key: str, height: int = 200):
+    """Render text preview with correct RTL/LTR and font for the language."""
+    if language == "ar":
+        # For Arabic: show in a styled div, not a textarea (textareas ignore RTL CSS in Streamlit)
+        preview = text[:3000].replace("<", "&lt;").replace(">", "&gt;")
+        st.markdown(
+            f"<div class='rtl-text' style='"
+            f"background:#161b22; border:1px solid #30363d; border-radius:4px; "
+            f"padding:0.8rem 1rem; max-height:{height}px; overflow-y:auto; "
+            f"color:#e6edf3; white-space:pre-wrap;'>"
+            f"{preview}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    elif language == "fr":
+        st.text_area("Extracted text", value=text, height=height,
+                     key=key, disabled=True)
+    else:
+        st.text_area("Extracted text", value=text, height=height,
+                     key=key, disabled=True)
+
+def language_detection_widget(text: str, selected_lang: str):
+    """Run language detection and display match/mismatch result."""
+    if not text or len(text.strip()) < 50:
+        return
+    detected = detect_language(text)
+    if detected == "unknown":
+        st.markdown("<span class='lang-unknown'>⊘ Language detection unavailable (install langdetect)</span>",
+                    unsafe_allow_html=True)
+        return
+
+    lang_names = {"en": "English", "ar": "Arabic", "fr": "French"}
+    detected_name = lang_names.get(detected, detected)
+
+    if detected == selected_lang:
+        st.markdown(
+            f"<span class='lang-match'>✓ Language verified: detected <strong>{detected_name}</strong> "
+            f"matches selected tag `{selected_lang}`</span>",
+            unsafe_allow_html=True
+        )
+    else:
+        selected_name = lang_names.get(selected_lang, selected_lang)
+        st.markdown(
+            f"<span class='lang-mismatch'>⚠ Language mismatch: detected <strong>{detected_name}</strong> "
+            f"but tag is set to `{selected_lang}` ({selected_name}). "
+            f"Verify before saving.</span>",
+            unsafe_allow_html=True
+        )
+
 def validate_doc(data: dict) -> tuple[list, list]:
     """Returns (hard_errors, soft_warnings)."""
     errors, warnings = [], []
@@ -496,6 +605,15 @@ def validate_doc(data: dict) -> tuple[list, list]:
             warnings.append(f"Text is {wc} words (below 500-word inclusion minimum — flagged)")
     if not data.get("url"):
         warnings.append("No URL provided")
+    # Language detection check
+    if LANGDETECT_AVAILABLE and data.get("full_text") and len(data["full_text"].strip()) >= 50:
+        detected = detect_language(data["full_text"])
+        if detected != "unknown" and detected != data.get("language"):
+            lang_names = {"en": "English", "ar": "Arabic", "fr": "French"}
+            warnings.append(
+                f"Language mismatch: detected '{lang_names.get(detected, detected)}' "
+                f"but tag is '{data.get('language')}' — verify before saving"
+            )
     return errors, warnings
 
 def docs_to_csv(docs: list) -> str:
@@ -616,8 +734,8 @@ def page_ingest():
             else:
                 full_text = raw.decode("utf-8", errors="replace")
             st.success(f"Extracted {word_count(full_text):,} words from {uploaded.name}")
-            st.text_area("Extracted text (editable)", value=full_text, height=200, key="upload_preview")
-            full_text = st.session_state.get("upload_preview", full_text)
+            render_text_preview(full_text, language, key="upload_preview", height=220)
+            language_detection_widget(full_text, language)
 
     with tab_scrape:
         scrape_url_input = st.text_input("URL to scrape", key="scrape_url_input")
@@ -626,7 +744,8 @@ def page_ingest():
                 with st.spinner("Fetching…"):
                     full_text = scrape_url(scrape_url_input)
                 st.success(f"Fetched {word_count(full_text):,} words")
-                st.text_area("Scraped text (editable)", value=full_text, height=200, key="scrape_preview")
+                render_text_preview(full_text, language, key="scrape_preview", height=220)
+                language_detection_widget(full_text, language)
                 full_text = st.session_state.get("scrape_preview", full_text)
             else:
                 st.warning("Enter a URL first.")
@@ -737,7 +856,7 @@ def page_corpus():
             unsafe_allow_html=True
         )
         with st.expander(f"Details / Annotate — {d['doc_id']}"):
-            st.text_area("Full text", value=d["full_text"], height=180, key=f"txt_{d['doc_id']}", disabled=True)
+            render_text_preview(d["full_text"], d["language"], key=f"txt_{d['doc_id']}", height=180)
             st.markdown("**Flattening annotation** (0 = none, 3 = strong)")
             ac1, ac2, ac3, ac4 = st.columns(4)
             with ac1:
